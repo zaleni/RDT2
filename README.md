@@ -1,3 +1,4 @@
+This version is adapted from RDT2, adding full parameter finetune method of RDT2-FM.
 
 <!-- markdownlint-disable first-line-h1 -->
 <!-- markdownlint-disable html -->
