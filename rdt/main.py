@@ -8,6 +8,24 @@ from accelerate.logging import get_logger
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Main script for training RDT.")
     parser.add_argument(
+        "--train_vlm",
+        action="store_true",
+        default=False,
+        help="Whether to finetune the vision-language backbone (Qwen2.5-VL). If False, VLM is frozen.",
+    )
+    parser.add_argument(
+        "--vlm_learning_rate",
+        type=float,
+        default=1e-5,
+        help="Learning rate for VLM parameters when --train_vlm is enabled.",
+    )
+    parser.add_argument(
+        "--vlm_weight_decay",
+        type=float,
+        default=0.0,
+        help="Weight decay for VLM parameter group when --train_vlm is enabled.",
+    )
+    parser.add_argument(
         "--config_path",
         type=str,
         default="configs/base.yaml",
@@ -198,7 +216,7 @@ def parse_args(input_args=None):
     )
     parser.add_argument(
         "--lr_num_cycles",
-        type=int,
+        type=float,
         default=1,
         help="Number of hard resets of the lr in cosine_with_restarts scheduler.",
     )

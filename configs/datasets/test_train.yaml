@@ -1,0 +1,9 @@
+name: bimanual/ur_example
+type: single
+# 修改为您数据的 shards 目录绝对路径
+shards_dir: /home/jiangjiahao/data/BimanualUR5eExample/shards
+kwargs:
+  # 修改为您数据的 instruction.json 绝对路径
+  instruction_path: /home/jiangjiahao/data/BimanualUR5eExample/instructions.json
+  # 修改为您数据的 normalizer 绝对路径
+  normalizer_path: /home/jiangjiahao/research/RDT2/umi_normalizer_wo_downsample_indentity_rot.pt

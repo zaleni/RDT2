@@ -37,6 +37,7 @@ def get_train_dataset(shards_dir):
             lambda sample: {
                 "image": sample["image.jpg"],
                 "action": sample["action.npy"],
+                "state": sample.get("state.npy"), # <--- 新增读取 state
                 "meta": sample["meta.json"],
             }
         )
@@ -96,7 +97,7 @@ def collate_fn(
     texts = []
     images = []
     actions = []
-
+    states = []
     for example in examples:
         image = example["image"]
         action = torch.from_numpy(example["action"])    # [T, 20]
@@ -104,7 +105,30 @@ def collate_fn(
         if image_corruption:
             image = image_corrupt(image)
 
-        instruction = instructions.get(example["meta"]["sub_task_instruction_key"], "")
+        # 处理 state
+        if example.get("state") is not None:
+             # 确保是 (1, state_dim)
+             s = torch.from_numpy(example["state"]).float()
+             if s.ndim == 1:
+                 s = s.unsqueeze(0)
+             states.append(s)
+        else:
+             states.append(torch.zeros((1, state_dim)))
+
+        # === 指令处理逻辑 ===
+        # 兼容两种模式：
+        # 1. 优先尝试从 meta 直接读取 text
+        # 2. 否则尝试从 instructions 字典查 Key
+        meta = example["meta"]
+        if "instruction" in meta:
+            instruction = meta["instruction"]
+            print("[DEBUG] using instruction from meta:", instruction)
+        elif "sub_task_instruction_key" in meta:
+            instruction = instructions.get(meta["sub_task_instruction_key"], "")
+            # print("[DEBUG] using instruction from sub_task_instruction_key")
+        else:
+            instruction = ""
+            print("[DEBUG] [WARNING] no instruction found, using empty string")
         
         messages = [
             {
@@ -127,9 +151,13 @@ def collate_fn(
     inputs = processor(text=texts, images=images, return_tensors="pt", padding=True)
     actions = torch.stack(actions, dim=0)  # (B, T, 20)
     
+    # states 列表里每个元素是 (1, state_dim)
+    # stack(dim=0) 后变成 (B, 1, state_dim)
+    states = torch.stack(states, dim=0) 
+    
     batch = {
         "vision_language_model_inputs": inputs,
-        "states": torch.zeros((actions.shape[0], 1, state_dim)),
+        "states": states, 
         "actions": actions,
     }
     

@@ -6,9 +6,11 @@ import os
 import socket
 from pathlib import Path
 from functools import partial
+from itertools import chain  # <-- add
 
 import diffusers
 import torch
+import torch.nn as nn
 import transformers
 import yaml
 from accelerate import Accelerator
@@ -30,6 +32,45 @@ from rdt.sample import log_sample_res
 if is_wandb_available():
     import wandb
 
+class _RDTWithVLM(nn.Module):
+    """DeepSpeed 只允许一个 model：把 RDT + VLM 封装成单一 nn.Module。"""
+    def __init__(self, rdt: nn.Module, vlm: nn.Module, selected_layers):
+        super().__init__()
+        self.rdt = rdt
+        self.vlm = vlm
+        self.selected_layers = selected_layers
+
+    def forward(
+        self,
+        *,
+        vlm_inputs: dict,
+        lang_attn_mask: torch.Tensor,
+        image_embeds: torch.Tensor | None,
+        states: torch.Tensor,
+        nsamples: torch.Tensor,
+    ):
+        # 如果 VLM 冻结，用 no_grad 省显存
+        vlm_trainable = any(p.requires_grad for p in self.vlm.parameters())
+        if (not self.vlm.training) or (not vlm_trainable):
+            with torch.no_grad():
+                outputs = self.vlm(**vlm_inputs, use_cache=True)
+        else:
+            outputs = self.vlm(**vlm_inputs, use_cache=True)
+
+        pkv = outputs.past_key_values
+        if isinstance(self.selected_layers, list):
+            vlang_kv_cache = [pkv[i] for i in self.selected_layers]
+        else:
+            vlang_kv_cache = [pkv[self.selected_layers]]
+
+        loss = self.rdt(
+            lang_kv_cache=vlang_kv_cache,
+            lang_attn_mask=lang_attn_mask,
+            img_tokens=image_embeds,
+            state_tokens=states,
+            action_gt=nsamples,
+        )
+        return loss
 
 def save_model_card(repo_id: str, base_model=str, repo_folder=None):
     yaml = f"""
@@ -124,17 +165,24 @@ def train(args, logger):
         weight_dtype = torch.bfloat16
 
     processor = AutoProcessor.from_pretrained(
-        "Qwen/Qwen2.5-VL-7B-Instruct",
+        args.pretrained_vision_language_model_name_or_path,
         padding_side="left",
         use_fast=True,
-    )  
+    )
     vision_language_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         args.pretrained_vision_language_model_name_or_path,
         torch_dtype=weight_dtype,
         attn_implementation="flash_attention_2",
-        device_map=accelerator.device,
+        device_map=None,
     )
-    vision_language_model.eval()
+
+    if args.train_vlm:
+        vision_language_model.train()
+        vision_language_model.requires_grad_(True)
+    else:
+        vision_language_model.eval()
+        vision_language_model.requires_grad_(False)
+
     # tokenizer = processor.tokenizer
 
     # if (
@@ -237,12 +285,36 @@ def train(args, logger):
 
     # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
     # which ensure saving model in huggingface format (config.json + pytorch_model.bin)
+    # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
     def save_model_hook(models, weights, output_dir):
-        if accelerator.is_main_process:
-            for model in models:
-                model_to_save = model.module if hasattr(model, "module") else model  # type: ignore
+        if not accelerator.is_main_process:
+            return
+
+        for model in models:
+            model_to_save = model.module if hasattr(model, "module") else model  # type: ignore
+
+            # 兼容：单独 rdt 或 wrapper
+            if isinstance(model_to_save, _RDTWithVLM):
+                # Save RDT
+                model_to_save.rdt.save_pretrained(output_dir)
+                # Save VLM (only if we finetune it)
+                if args.train_vlm:
+                    vlm_dir = os.path.join(output_dir, "vlm")
+                    os.makedirs(vlm_dir, exist_ok=True)
+                    model_to_save.vlm.save_pretrained(vlm_dir)
+                    processor.save_pretrained(vlm_dir)
+
+            else:
+                # Save RDT
                 if isinstance(model_to_save, type(accelerator.unwrap_model(rdt))):
                     model_to_save.save_pretrained(output_dir)
+
+                # Save VLM (only if we finetune it)
+                if args.train_vlm and isinstance(model_to_save, Qwen2_5_VLForConditionalGeneration):
+                    vlm_dir = os.path.join(output_dir, "vlm")
+                    os.makedirs(vlm_dir, exist_ok=True)
+                    model_to_save.save_pretrained(vlm_dir)
+                    processor.save_pretrained(vlm_dir)
 
     accelerator.register_save_state_pre_hook(save_model_hook)
 
@@ -274,7 +346,14 @@ def train(args, logger):
         optimizer_class = torch.optim.AdamW
 
     # Optimizer creation
-    params_to_optimize = rdt.parameters()
+    if args.train_vlm:
+        params_to_optimize = [
+            {"params": rdt.parameters(), "lr": args.learning_rate, "weight_decay": args.adam_weight_decay},
+            {"params": vision_language_model.parameters(), "lr": args.vlm_learning_rate, "weight_decay": args.vlm_weight_decay},
+        ]
+    else:
+        params_to_optimize = rdt.parameters()
+
     optimizer = optimizer_class(
         params_to_optimize,
         lr=args.learning_rate,
@@ -382,16 +461,38 @@ def train(args, logger):
     )
 
     # Prepare everything with our `accelerator`.
-    rdt, optimizer, train_dataloader, sample_dataloader, lr_scheduler = accelerator.prepare(
-        rdt, optimizer, train_dataloader, sample_dataloader, lr_scheduler
-    )
+    # DeepSpeed 下 train_vlm=True 时只能 prepare 一个 model：用 wrapper
+    using_ds = args.deepspeed is not None
 
-    # text_encoder is alredy moved to the correct device and dtype -> skip!
+    if args.train_vlm and using_ds:
+        train_model = _RDTWithVLM(rdt=rdt, vlm=vision_language_model, selected_layers=config["model"]["selected_layers"])
+        train_model, optimizer, train_dataloader, sample_dataloader, lr_scheduler = accelerator.prepare(
+            train_model, optimizer, train_dataloader, sample_dataloader, lr_scheduler
+        )
+        # 方便后面继续使用原变量名（注意：不要单独对 vlm 做 forward 训练；训练走 train_model）
+        inner = train_model.module if hasattr(train_model, "module") else train_model
+        rdt = inner.rdt
+        vision_language_model = inner.vlm
+    else:
+        if args.train_vlm:
+            rdt, vision_language_model, optimizer, train_dataloader, sample_dataloader, lr_scheduler = accelerator.prepare(
+                rdt, vision_language_model, optimizer, train_dataloader, sample_dataloader, lr_scheduler
+            )
+        else:
+            rdt, optimizer, train_dataloader, sample_dataloader, lr_scheduler = accelerator.prepare(
+                rdt, optimizer, train_dataloader, sample_dataloader, lr_scheduler
+            )
+            vision_language_model.to(accelerator.device, dtype=weight_dtype)
+        train_model = None  # <-- add
+
     if vision_encoder is not None:
         vision_encoder.to(accelerator.device, dtype=weight_dtype)
+
+
+    # 不要在 train_vlm=True 且 prepare 之后再强行 .to()，避免对 deepspeed/包裹对象做多余操作
     
-    if vision_language_model is not None:
-        vision_language_model.to(accelerator.device, dtype=weight_dtype)
+    # if vision_language_model is not None:
+    #     vision_language_model.to(accelerator.device, dtype=weight_dtype)
 
     if overrode_max_train_steps:
         # We need to recalculate our total training steps as the size of the training dataloader may have changed.
@@ -447,14 +548,18 @@ def train(args, logger):
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
             try:
-                accelerator.load_state(os.path.join(args.output_dir, path)) # load_module_strict=False
+                accelerator.load_state(os.path.join(args.output_dir, path))
             except:
-                # load deepspeed's state_dict
                 logger.info("Resuming training state failed. Attempting to only load from model checkpoint.")
                 checkpoint = torch.load(os.path.join(args.output_dir, path, "pytorch_model", "mp_rank_00_model_states.pt"))
-                rdt.module.load_state_dict(checkpoint["module"])
 
-            # load_model(ema_rdt, os.path.join(args.output_dir, path, "ema", "model.safetensors"))
+                # 兼容 wrapper / 非 wrapper
+                if args.train_vlm and using_ds and train_model is not None:
+                    target = train_model.module if hasattr(train_model, "module") else train_model
+                else:
+                    target = rdt.module if hasattr(rdt, "module") else rdt
+                target.load_state_dict(checkpoint.get("module", checkpoint), strict=False)
+
             global_step = int(path.split("-")[1])
 
             resume_global_step = global_step * args.gradient_accumulation_steps
@@ -467,6 +572,10 @@ def train(args, logger):
 
     for epoch in range(first_epoch, args.num_train_epochs):
         rdt.train()
+        if args.train_vlm:
+            vision_language_model.train()
+        else:
+            vision_language_model.eval()
 
         # Set the progress_bar to correct position
         if args.resume_from_checkpoint and epoch == first_epoch:
@@ -474,18 +583,24 @@ def train(args, logger):
 
         # Forward and backward...
         for batch in train_dataloader:
-            with accelerator.accumulate(rdt):
+            # DeepSpeed+train_vlm：accumulate 只传单个 wrapper model
+            if args.train_vlm and using_ds and train_model is not None:
+                accumulate_ctx = accelerator.accumulate(train_model)
+            else:
+                accumulate_ctx = accelerator.accumulate(rdt)
+
+            with accumulate_ctx:
                 actions = batch["actions"]
                 nsamples = normalizer["action"].normalize(actions).to(
                     dtype=weight_dtype, device=accelerator.device
                 )
-                states = batch["states"].to(dtype=weight_dtype)
+
+                states = batch["states"].to(dtype=weight_dtype, device=accelerator.device)
 
                 with torch.no_grad():
                     image_embeds = None
                     if vision_encoder is not None:
-                        images = {k: v.to(dtype=weight_dtype) for k, v in batch["images"].items()}
-                        
+                        images = {k: v.to(device=accelerator.device, dtype=weight_dtype) for k, v in batch["images"].items()}
                         k = next(iter(images))
                         batch_size, _, C, H, W = images[k].shape
                         for k in images:
@@ -493,38 +608,64 @@ def train(args, logger):
                         image_embeds = vision_encoder(images).detach()
                         image_embeds = image_embeds.reshape((batch_size, -1, vision_encoder.embed_dim))
 
-                    if vision_language_model is not None:
-                        lang_attn_mask = batch["vision_language_model_inputs"]["attention_mask"].to(dtype=torch.bool)
-                        outputs = vision_language_model(
-                            **batch["vision_language_model_inputs"],
-                            use_cache=True,
-                        )
-                        
-                        selected_layers = config["model"]["selected_layers"]
-                        if isinstance(selected_layers, list):
-                            vlang_kv_cache = [
-                                outputs.past_key_values[i]
-                                for i in selected_layers
-                            ]
-                        else:
-                            vlang_kv_cache = [
-                                outputs.past_key_values[selected_layers]]
+                vlm_inputs = batch["vision_language_model_inputs"]
+                vlm_inputs = {
+                    k: (
+                        v.to(device=accelerator.device, dtype=weight_dtype)
+                        if torch.is_tensor(v) and v.is_floating_point()
+                        else (v.to(device=accelerator.device) if torch.is_tensor(v) else v)
+                    )
+                    for k, v in vlm_inputs.items()
+                }
+                lang_attn_mask = vlm_inputs["attention_mask"].to(dtype=torch.bool)
 
-                loss = rdt(
-                    lang_kv_cache=vlang_kv_cache,
-                    lang_attn_mask=lang_attn_mask,
-                    img_tokens=image_embeds,
-                    state_tokens=states,
-                    action_gt=nsamples,
-                )
+                # 训练 loss：DeepSpeed+train_vlm 走 wrapper forward（单模型）
+                if args.train_vlm and using_ds and train_model is not None:
+                    loss = train_model(
+                        vlm_inputs=vlm_inputs,
+                        lang_attn_mask=lang_attn_mask,
+                        image_embeds=image_embeds,
+                        states=states,
+                        nsamples=nsamples,
+                    )
+                else:
+                    # ---- 原逻辑保持：VLM 前向只跑一次 ----
+                    if args.train_vlm:
+                        outputs = vision_language_model(**vlm_inputs, use_cache=True)
+                    else:
+                        with torch.no_grad():
+                            outputs = vision_language_model(**vlm_inputs, use_cache=True)
+
+                    selected_layers = config["model"]["selected_layers"]
+                    if isinstance(selected_layers, list):
+                        vlang_kv_cache = [outputs.past_key_values[i] for i in selected_layers]
+                    else:
+                        vlang_kv_cache = [outputs.past_key_values[selected_layers]]
+
+                    loss = rdt(
+                        lang_kv_cache=vlang_kv_cache,
+                        lang_attn_mask=lang_attn_mask,
+                        img_tokens=image_embeds,
+                        state_tokens=states,
+                        action_gt=nsamples,
+                    )
 
                 accelerator.backward(loss)
+
                 if accelerator.sync_gradients:
-                    params_to_clip = rdt.parameters()
+                    if args.train_vlm:
+                        if args.train_vlm and using_ds and train_model is not None:
+                            params_to_clip = train_model.parameters()
+                        else:
+                            params_to_clip = chain(rdt.parameters(), vision_language_model.parameters())
+                    else:
+                        params_to_clip = rdt.parameters()
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=args.set_grads_to_none)
+
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -552,7 +693,16 @@ def train(args, logger):
                     logger.info(sample_loss_for_log)
                     accelerator.log(sample_loss_for_log, step=global_step)
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"loss": loss.detach().item()}
+            
+            # 自动遍历优化器里的所有参数组
+            for i, pg in enumerate(optimizer.param_groups):
+                # 如果是第0组通常是RDT，第1组是VLM (根据你创建optimizer时的顺序)
+                # 为了保险，直接用索引命名，或者根据 train_vlm 判断
+                name = "lr_rdt" if i == 0 else "lr_vlm"
+                logs[name] = pg["lr"]
+            # === 修改结束 ===
+
             if args.enable_distill:
                 logs.update(rdt.get_loss_dict())
             progress_bar.set_postfix(**logs)
@@ -564,9 +714,25 @@ def train(args, logger):
     # Create the pipeline using using the trained modules and save it.
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        accelerator.unwrap_model(rdt).save_pretrained(args.output_dir)
+        # 保存：wrapper 情况下从 wrapper 里取 rdt / vlm
+        if args.train_vlm and using_ds and train_model is not None:
+            inner = accelerator.unwrap_model(train_model)
+            inner.rdt.save_pretrained(args.output_dir)
+            if args.train_vlm:
+                vlm_dir = os.path.join(args.output_dir, "vlm")
+                os.makedirs(vlm_dir, exist_ok=True)
+                inner.vlm.save_pretrained(vlm_dir)
+                processor.save_pretrained(vlm_dir)
+        else:
+            accelerator.unwrap_model(rdt).save_pretrained(args.output_dir)
+            if args.train_vlm:
+                vlm_dir = os.path.join(args.output_dir, "vlm")
+                os.makedirs(vlm_dir, exist_ok=True)
+                accelerator.unwrap_model(vision_language_model).save_pretrained(vlm_dir)
+                processor.save_pretrained(vlm_dir)
 
         logger.info(f"Saved Model to {args.output_dir}")
+
 
         if args.push_to_hub:
             save_model_card(

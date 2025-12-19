@@ -1,0 +1,9 @@
+name: bimanual/robotwin_aloha
+type: single
+# 修改为您数据的 shards 目录绝对路径
+shards_dir: /home/jiangjiahao/data/rdt2_robotwin/rdt2_robotwin_shards
+kwargs:
+  # 修改为您数据的 instruction.json 绝对路径
+  instruction_path: /home/jiangjiahao/data/rdt2_robotwin/robotwin_instruction.json
+  # 修改为您数据的 normalizer 绝对路径
+  normalizer_path: /home/jiangjiahao/data/rdt2_robotwin/robotwin_joint_14d_normalizer.pt
